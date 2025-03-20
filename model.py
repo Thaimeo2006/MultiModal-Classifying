@@ -185,7 +185,7 @@ tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
 
 dataset = MyDataset(
     csv_file="training_data.csv",
-    image_dir="D:\pythonhaha",
+    image_dir="Multimodal-Classifying",
     tokenizer=tokenizer
 )
 
