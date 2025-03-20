@@ -3,7 +3,7 @@ import torch.nn as nn
 import torchvision.models as models
 from transformers import BertModel, BertTokenizer
 import torch.optim as optim
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, random_split
 from PIL import Image
 import pandas as pd
 from torchvision import transforms
@@ -57,12 +57,9 @@ class FusionModule(nn.Module):
         self.image_encoder = ImageEncoder()
         self.text_encoder = TextEncoder()
         self.text_fc = nn.Linear(768, 512)  # Map text vector to 512 dim (để khớp với image vector)
-        self.fc_layer = nn.Linear(512, 512)  # For the combined vector
+        self.fc_layer = nn.Linear(1024, 512)  # For the combined vector
         self.final_fc = nn.Linear(512, 10)   # Lớp cuối cho phân loại
 
-        # Khởi tạo Cross Multi-Head Attention và Layer Normalization một lần trong __init__
-        self.cross_attn = Cross_MHA(embed_dim=512, num_heads=8)
-        self.self_attn = Cross_MHA(embed_dim=512, num_heads=8)  # Dùng cho self attention của vector kết hợp
         self.add_norm1 = AddNorm(embed_dim=512)
         self.add_norm2 = AddNorm(embed_dim=512)
         self.relu = nn.ReLU()
@@ -74,32 +71,13 @@ class FusionModule(nn.Module):
         text = self.text_encoder(input_ids, attention_mask)  # [batch, 768]
         text = self.text_fc(text)  # [batch, 512]
         
-        # Sử dụng module cross attention đã khởi tạo sẵn
-        # Text Cross: text (query) attend image (key, value)
-        text_cross, _ = self.cross_attn(query=text, key=img, value=img)
-        
-        # Image Cross: image (query) attend text (key, value)
-        img_cross, _ = self.cross_attn(query=img, key=text, value=text)
-        
-        # Kết hợp hai vector
-        combined = torch.cat((text_cross, img_cross), dim=1)  # [batch, 1024]
-        # Nếu cần giảm kích thước, có thể thêm một layer linear để map về 512
-        # Ví dụ:
-        combined = nn.Linear(1024, 512).to(combined.device)(combined)
-        
-        # Self Multi-Head Attention cho vector kết hợp
-        self_attn_output, _ = self.self_attn(query=combined, key=combined, value=combined)
-        
-        # Add & Norm
-        combined = self.add_norm1(combined, self_attn_output)
+        combined = torch.cat((img, text), dim=1)  # [batch, 1024]
         
         # Feed Forward Layer
         ff_output = self.fc_layer(combined)
         ff_output = self.relu(ff_output)
-        combined = self.add_norm2(combined, ff_output)
-        
         # Lớp phân loại cuối cùng
-        output = self.final_fc(combined)
+        output = self.final_fc(ff_output)
         return output
 
     
@@ -154,7 +132,7 @@ class MyDataset(Dataset):
         
     
 #train function
-def train(model, dataloader, epochs=15, lr=0.001):
+def train(model, dataloader, epochs=30, lr=0.0001):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
     criterion = nn.CrossEntropyLoss() #Loss function for classification
@@ -189,9 +167,33 @@ dataset = MyDataset(
     tokenizer=tokenizer
 )
 
-train_loader = DataLoader(dataset, batch_size=8, shuffle=True)
+train_size = int(0.8 * len(dataset))
+test_size = len(dataset) - train_size
+train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
+
+train_loader = DataLoader(train_dataset, batch_size=9, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=5)
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = FusionModule().to(device)
 
 train(model, train_loader)
+torch.save(model, "multimodal.pth")
+
+correct = 0
+total = 0
+with torch.no_grad():
+    for batch in test_loader:
+        image = batch["image"].to(device)
+        input_ids = batch["input_ids"].to(device)
+        attention_mask = batch["attention_mask"].to(device)
+        label_id = batch["label_id"].to(device)
+        outputs = model(image, input_ids, attention_mask)
+        outputs = nn.Softmax(dim=-1)(outputs)
+        predicted_label = torch.argmax(outputs, dim=1)
+        correct += (predicted_label == label_id).sum().item()
+        total += label_id.size(0)
+
+accuracy = correct / total
+print(f"Test accuracy: {accuracy:.4f}")
+        
