@@ -13,8 +13,14 @@ import os
 class ImageEncoder(nn.Module):
     def __init__(self):
         super(ImageEncoder, self).__init__()
-        self.resnet = models.resnet18(pretrained=True) #Call pretrained resnet18
+
+        try:
+            self.resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT) #Call pretrained resnet18
+        except Exception:
+            self.resnet = models.resnet18(pretrained=True) #Call pretrained resnet18
+
         self.resnet.fc = nn.Identity() #delete the last layer
+
     def forward(self, x):
         return self.resnet(x)
     
@@ -39,7 +45,14 @@ class Cross_MHA(nn.Module):
         self.mha = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
     
     def forward(self, query, key, value, key_padding_mask=None):
-        attn_output, attn_weights = self.mha(query, key, value, key_padding_mask)
+
+        # FIX: pass as keyword to avoid accidental position mismatch
+        attn_output, attn_weights = self.mha(
+            query=query,
+            key=key,
+            value=value,
+            key_padding_mask=key_padding_mask
+        )
         return attn_output, attn_weights
     
 #Add and Norm Layer
@@ -61,12 +74,16 @@ class FusionModule(nn.Module):
         self.final_fc = nn.Linear(512, 10)   # Lớp cuối cho phân loại
 
         # Khởi tạo Cross Multi-Head Attention và Layer Normalization một lần trong __init__
-        self.cross_attn = Cross_MHA(embed_dim=512, num_heads=8)
+        self.cross_attn_text = Cross_MHA(embed_dim=512, num_heads=8)   # FIX: tách 2 cross-attn (đỡ dùng chung trọng số)
+        self.cross_attn_img  = Cross_MHA(embed_dim=512, num_heads=8)
         self.self_attn = Cross_MHA(embed_dim=512, num_heads=8)  # Dùng cho self attention của vector kết hợp
         self.add_norm1 = AddNorm(embed_dim=512)
         self.add_norm2 = AddNorm(embed_dim=512)
         self.relu = nn.ReLU()
         self.softmax = nn.Softmax(dim=-1)
+
+        # FIX: Không được tạo Linear trong forward. Tạo sẵn ở đây.
+        self.combine_fc = nn.Linear(1024, 512)
         
     def forward(self, image, input_ids, attention_mask):
         # Encode ảnh và văn bản
@@ -74,18 +91,23 @@ class FusionModule(nn.Module):
         text = self.text_encoder(input_ids, attention_mask)  # [batch, 768]
         text = self.text_fc(text)  # [batch, 512]
         
+        # FIX: MultiheadAttention cần input shape [batch, seq_len, embed_dim]
+        # Ta coi mỗi modality là 1 token => seq_len = 1
+        img = img.unsqueeze(1)    # [batch, 1, 512]
+        text = text.unsqueeze(1)  # [batch, 1, 512]
+        
         # Sử dụng module cross attention đã khởi tạo sẵn
         # Text Cross: text (query) attend image (key, value)
-        text_cross, _ = self.cross_attn(query=text, key=img, value=img)
+        text_cross, _ = self.cross_attn_text(query=text, key=img, value=img)
         
         # Image Cross: image (query) attend text (key, value)
-        img_cross, _ = self.cross_attn(query=img, key=text, value=text)
+        img_cross, _ = self.cross_attn_img(query=img, key=text, value=text)
         
         # Kết hợp hai vector
-        combined = torch.cat((text_cross, img_cross), dim=1)  # [batch, 1024]
+        combined = torch.cat((text_cross, img_cross), dim=-1)  # [batch, 1, 1024]
         # Nếu cần giảm kích thước, có thể thêm một layer linear để map về 512
         # Ví dụ:
-        combined = nn.Linear(1024, 512).to(combined.device)(combined)
+        combined = self.combine_fc(combined)  # FIX: dùng layer đã khai báo trong __init__
         
         # Self Multi-Head Attention cho vector kết hợp
         self_attn_output, _ = self.self_attn(query=combined, key=combined, value=combined)
@@ -99,7 +121,9 @@ class FusionModule(nn.Module):
         combined = self.add_norm2(combined, ff_output)
         
         # Lớp phân loại cuối cùng
-        output = self.final_fc(combined)
+        output = self.final_fc(combined)  # [batch, 1, 10]
+
+        output = output.squeeze(1)        # [batch, 10]
         return output
 
     
@@ -114,7 +138,8 @@ class MyDataset(Dataset):
         self.transform = transform if transform else transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
     def __len__(self):
