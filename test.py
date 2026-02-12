@@ -13,7 +13,12 @@ import os
 class ImageEncoder(nn.Module):
     def __init__(self):
         super(ImageEncoder, self).__init__()
-        self.resnet = models.resnet18(pretrained=True) #Call pretrained resnet18
+
+        try:
+            self.resnet = models.resnet18(weights=models.ResNet18_Weights.DEFAULT) #Call pretrained resnet18
+        except Exception:
+            self.resnet = models.resnet18(pretrained=True) #Call pretrained resnet18
+
         self.resnet.fc = nn.Identity() #delete the last layer
     def forward(self, x):
         return self.resnet(x)
@@ -39,7 +44,13 @@ class Cross_MHA(nn.Module):
         self.mha = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
     
     def forward(self, query, key, value, key_padding_mask=None):
-        attn_output, attn_weights = self.mha(query, key, value, key_padding_mask)
+
+        attn_output, attn_weights = self.mha(
+            query=query,
+            key=key,
+            value=value,
+            key_padding_mask=key_padding_mask
+        )
         return attn_output, attn_weights
     
 #Add and Norm Layer
@@ -57,6 +68,7 @@ class FusionModule(nn.Module):
         self.image_encoder = ImageEncoder()
         self.text_encoder = TextEncoder()
         self.text_fc = nn.Linear(768, 512)  # Map text vector to 512 dim (để khớp với image vector)
+
         self.fc_layer = nn.Linear(1024, 512)  # For the combined vector
         self.final_fc = nn.Linear(512, 10)   # Lớp cuối cho phân loại
 
@@ -74,10 +86,14 @@ class FusionModule(nn.Module):
         combined = torch.cat((img, text), dim=1)  # [batch, 1024]
         
         # Feed Forward Layer
-        ff_output = self.fc_layer(combined)
+        ff_output = self.fc_layer(combined)       # [batch, 512]
         ff_output = self.relu(ff_output)
+
+        ff_output = self.add_norm1(ff_output, torch.zeros_like(ff_output))
+
         # Lớp phân loại cuối cùng
-        output = self.final_fc(ff_output)
+        output = self.final_fc(ff_output)         # [batch, 10]
+
         return output
 
     
@@ -92,7 +108,9 @@ class MyDataset(Dataset):
         self.transform = transform if transform else transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
+
+            # FIX: nếu dùng ResNet pretrained ImageNet thì nên dùng normalize chuẩn ImageNet
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
         ])
         
     def __len__(self):
@@ -178,8 +196,10 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 model = FusionModule().to(device)
 
 train(model, train_loader)
-torch.save(model, "multimodal.pth")
 
+torch.save(model.state_dict(), "multimodal.pth")
+
+model.eval()
 correct = 0
 total = 0
 with torch.no_grad():
@@ -188,12 +208,10 @@ with torch.no_grad():
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         label_id = batch["label_id"].to(device)
-        outputs = model(image, input_ids, attention_mask)
-        outputs = nn.Softmax(dim=-1)(outputs)
+        outputs = model(image, input_ids, attention_mask)       # logits [B, 10]
         predicted_label = torch.argmax(outputs, dim=1)
         correct += (predicted_label == label_id).sum().item()
         total += label_id.size(0)
 
-accuracy = correct / total
+accuracy = correct / total if total > 0 else 0.0
 print(f"Test accuracy: {accuracy:.4f}")
-        
